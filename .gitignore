@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual Environment
+venv/
+env/
+.env/
+.venv/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Model files (use HuggingFace Hub instead)
+models/*.h5
+models/*.pkl
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# Dataset / Raw video (too large for GitHub)
+data/raw_videos/
+data/keypoints/*.npy
+data/keypoints/*.npz
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Environment variables
+.env
+secrets.txt
+
+# Temporary files
+tmp/
+temp/
+
+# Large dataset files
+*.csv
+*.zip
+data/keypoints/*.npy
+models/*.h5
+models/*.pkl
+hand_landmarker.task
