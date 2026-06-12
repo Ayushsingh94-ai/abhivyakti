@@ -1,6 +1,6 @@
 """
-Abhivyakti — Real-Time Inference Engine
-Recognizes ISL signs from webcam using trained model
+Abhivyakti — Combined Real-Time Inference Engine
+Recognizes both A-Z alphabets (static) and ISL words (dynamic gestures)
 """
 
 import cv2
@@ -10,16 +10,22 @@ import tensorflow as tf
 import pickle
 import os
 import urllib.request
+from collections import deque
 
 # ── Configuration ──────────────────────────
-MODEL_PATH = "models/isl_model.h5"
-ENCODER_PATH = "models/label_encoder.pkl"
-SCALER_PATH = "models/scaler.pkl"
-CONFIDENCE_THRESHOLD = 0.85
+ALPHA_MODEL_PATH = "models/isl_model.h5"
+ALPHA_ENCODER_PATH = "models/label_encoder.pkl"
+ALPHA_SCALER_PATH = "models/scaler.pkl"
+
+WORD_MODEL_PATH = "models/isl_word_model.h5"
+WORD_ENCODER_PATH = "models/word_label_encoder.pkl"
+
+SEQUENCE_LENGTH = 30
+ALPHA_CONFIDENCE_THRESHOLD = 0.85
+WORD_CONFIDENCE_THRESHOLD = 0.70
 STABLE_FRAMES = 15
 MP_MODEL_PATH = "hand_landmarker.task"
 
-# A-Z mapping
 SIGN_LABELS = {i: chr(65 + i) for i in range(26)}
 
 # ── Download MediaPipe Model ────────────────
@@ -29,18 +35,21 @@ if not os.path.exists(MP_MODEL_PATH):
     urllib.request.urlretrieve(url, MP_MODEL_PATH)
     print("✅ Downloaded!")
 
-# ── Load Models ─────────────────────────────
-print("📂 Loading models...")
-try:
-    model = tf.keras.models.load_model(MODEL_PATH)
-    with open(ENCODER_PATH, 'rb') as f:
-        le = pickle.load(f)
-    with open(SCALER_PATH, 'rb') as f:
-        scaler = pickle.load(f)
-    print("✅ All models loaded!")
-except Exception as e:
-    print(f"❌ Error loading models: {e}")
-    exit()
+# ── Load Alphabet Model ─────────────────────
+print("📂 Loading alphabet model...")
+alpha_model = tf.keras.models.load_model(ALPHA_MODEL_PATH)
+with open(ALPHA_ENCODER_PATH, 'rb') as f:
+    alpha_le = pickle.load(f)
+with open(ALPHA_SCALER_PATH, 'rb') as f:
+    alpha_scaler = pickle.load(f)
+print("✅ Alphabet model loaded!")
+
+# ── Load Word Model ──────────────────────────
+print("📂 Loading word model...")
+word_model = tf.keras.models.load_model(WORD_MODEL_PATH)
+with open(WORD_ENCODER_PATH, 'rb') as f:
+    word_le = pickle.load(f)
+print("✅ Word model loaded!")
 
 # ── MediaPipe Setup ─────────────────────────
 BaseOptions = mp.tasks.BaseOptions
@@ -81,7 +90,6 @@ def extract_keypoints(result):
     return np.concatenate([left_hand, right_hand])
 
 def draw_landmarks(frame, result):
-    """Draw hand landmarks and connections."""
     if not result.hand_landmarks:
         return frame
     h, w, _ = frame.shape
@@ -103,15 +111,34 @@ def draw_landmarks(frame, result):
             cv2.line(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
     return frame
 
-def predict_sign(keypoints):
-    """Predict ISL sign from keypoints."""
-    keypoints_scaled = scaler.transform([keypoints])
-    predictions = model.predict(keypoints_scaled, verbose=0)
+def predict_alphabet(keypoints):
+    """Predict A-Z from single frame keypoints."""
+    keypoints_scaled = alpha_scaler.transform([keypoints])
+    predictions = alpha_model.predict(keypoints_scaled, verbose=0)
     confidence = float(np.max(predictions))
     class_idx = np.argmax(predictions)
-    label = le.inverse_transform([class_idx])[0]
+    label = alpha_le.inverse_transform([class_idx])[0]
     sign = SIGN_LABELS.get(label, str(label))
     return sign, confidence
+
+def predict_word(sequence):
+    """Predict ISL word from a 30-frame sequence."""
+    sequence = np.array(sequence).reshape(1, SEQUENCE_LENGTH, 126)
+    predictions = word_model.predict(sequence, verbose=0)
+    confidence = float(np.max(predictions))
+    class_idx = np.argmax(predictions)
+    word = word_le.inverse_transform([class_idx])[0]
+    return word, confidence
+
+def calculate_motion(sequence):
+    """Calculate average motion between consecutive frames."""
+    if len(sequence) < 2:
+        return 0
+    diffs = []
+    for i in range(1, len(sequence)):
+        diff = np.mean(np.abs(sequence[i] - sequence[i-1]))
+        diffs.append(diff)
+    return np.mean(diffs)
 
 # ── Main Inference Loop ─────────────────────
 def run_inference():
@@ -120,8 +147,8 @@ def run_inference():
         print("❌ Could not open webcam!")
         return
 
-    print("\n🤟 Abhivyakti — Live Inference")
-    print("=" * 40)
+    print("\n🤟 Abhivyakti — Live Inference (Alphabets + Words)")
+    print("=" * 50)
     print("Q = Quit | C = Clear sentence")
 
     # State
@@ -129,6 +156,10 @@ def run_inference():
     sentence = []
     last_added = ""
     stable_count = 0
+
+    # Rolling buffer for word detection
+    frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
+    MOTION_THRESHOLD = 0.005  # Above this = word gesture, below = static alphabet
 
     with HandLandmarker.create_from_options(options) as landmarker:
         while True:
@@ -141,7 +172,6 @@ def run_inference():
             h, w, _ = frame.shape
 
             try:
-                # ── Detection ───────────────
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(
                     image_format=mp.ImageFormat.SRGB,
@@ -151,9 +181,27 @@ def run_inference():
                 frame = draw_landmarks(frame, result)
 
                 if result.hand_landmarks:
-                    # ── Predict ─────────────
                     keypoints = extract_keypoints(result)
-                    sign, confidence = predict_sign(keypoints)
+                    frame_buffer.append(keypoints)
+
+                    # Calculate motion to decide alphabet vs word
+                    motion = calculate_motion(list(frame_buffer))
+
+                    if motion < MOTION_THRESHOLD:
+                        # ── STATIC → Alphabet Detection ──
+                        sign, confidence = predict_alphabet(keypoints)
+                        mode = "ALPHABET"
+                        threshold = ALPHA_CONFIDENCE_THRESHOLD
+
+                    elif len(frame_buffer) == SEQUENCE_LENGTH:
+                        # ── DYNAMIC → Word Detection ──
+                        sign, confidence = predict_word(list(frame_buffer))
+                        mode = "WORD"
+                        threshold = WORD_CONFIDENCE_THRESHOLD
+                    else:
+                        sign, confidence = "...", 0.0
+                        mode = "BUFFERING"
+                        threshold = 1.0
 
                     # ── Stability check ──────
                     if sign == current_sign:
@@ -164,28 +212,36 @@ def run_inference():
 
                     # ── Add to sentence ──────
                     if (stable_count == STABLE_FRAMES and
-                            confidence > CONFIDENCE_THRESHOLD and
+                            confidence > threshold and
                             sign != last_added):
                         sentence.append(sign)
                         last_added = sign
-                        print(f"✅ {sign} ({confidence*100:.1f}%)")
+                        print(f"✅ [{mode}] {sign} ({confidence*100:.1f}%)")
 
-                    # ── Display sign ─────────
-                    color = (0, 255, 0) if confidence > CONFIDENCE_THRESHOLD else (0, 165, 255)
-                    cv2.putText(frame, f"{sign}", (20, 80),
-                                cv2.FONT_HERSHEY_SIMPLEX, 3, color, 4)
+                    # ── Display ──────────────
+                    color = (0, 255, 0) if confidence > threshold else (0, 165, 255)
+                    mode_color = (0, 255, 255) if mode == "ALPHABET" else (255, 100, 255)
+
+                    cv2.putText(frame, f"[{mode}]", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 2)
+                    cv2.putText(frame, f"{sign}", (20, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 4)
                     cv2.putText(frame, f"{confidence*100:.1f}%", (20, 130),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-                    # ── Stability bar ────────
+                    # Motion indicator
+                    cv2.putText(frame, f"Motion: {motion:.4f}", (20, 165),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+                    # Stability bar
                     bar = int((stable_count / STABLE_FRAMES) * 200)
-                    cv2.rectangle(frame, (20, 145), (220, 160), (50,50,50), -1)
-                    cv2.rectangle(frame, (20, 145), (20+bar, 160), (0,255,0), -1)
+                    cv2.rectangle(frame, (20, 175), (220, 190), (50,50,50), -1)
+                    cv2.rectangle(frame, (20, 175), (20+bar, 190), (0,255,0), -1)
 
                 else:
-                    # No hand
                     stable_count = 0
                     last_added = ""
+                    frame_buffer.clear()
                     cv2.putText(frame, "Show hand...", (20, 80),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
@@ -193,13 +249,12 @@ def run_inference():
                 print(f"⚠️ {e}")
 
             # ── Sentence bar ─────────────────
-            sentence_text = " ".join(sentence[-15:])
+            sentence_text = " ".join(sentence[-12:])
             cv2.rectangle(frame, (0, h-55), (w, h), (20, 20, 20), -1)
             cv2.putText(frame, f"Sentence: {sentence_text}",
                         (10, h-18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (255, 255, 255), 2)
 
-            # ── Controls ─────────────────────
             cv2.putText(frame, "Q:Quit | C:Clear",
                         (w-190, 25), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (180, 180, 180), 1)
